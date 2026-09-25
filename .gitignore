@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.next/
+out/
+.sst/
+.open-next/
+.amplify/
+amplify_outputs*.json
+*.tsbuildinfo
+.env
+.env.local
+.DS_Store
+coverage/

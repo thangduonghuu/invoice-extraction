@@ -1,0 +1,15 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "types": ["node", "aws-lambda"],
+    // This is an application (Lambda handlers + Amplify infra), never a
+    // library consumed via .d.ts - and pnpm's hashed node_modules paths
+    // make declaration emit fail on inferred Amplify construct types.
+    "declaration": false,
+    "declarationMap": false
+  },
+  "include": ["src", "amplify"]
+}
