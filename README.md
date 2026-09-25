@@ -1,17 +1,18 @@
 # Insta Quote AI - invoice line-item extraction with evidence and refusals
 
-Built from `PROMPT.md`. Two parts in one pnpm monorepo:
+Built from `PROMPT.md`. Two parts:
 
-- **Part A** (`packages/engine`, `backend`) - a pure `extract(pdfBytes) -> ExtractionResult` function, adapted onto AWS Lambda via AWS Amplify Gen 2.
-- **Part B** (`web`) - a React (Vite) page that uploads a PDF and shows the result in plain language.
+- **Part A** (`packages/schema`, `packages/engine`, `backend`) - a pure `extract(pdfBytes) -> ExtractionResult` function, adapted onto AWS Lambda via AWS Amplify Gen 2. One pnpm workspace.
+- **Part B** (`web`) - a React (Vite) page that uploads a PDF and shows the result in plain language. **Deliberately standalone** - its own package manager (npm, not pnpm), not a member of the workspace, and it keeps its own copy of the wire-contract types (`web/src/lib/schema.ts`) instead of importing `packages/schema`. It's meant to be pushed to its own separate repo whenever you're ready; it's just sitting in this same folder tree for convenience right now, and has zero build-time dependency on anything else here.
 
 The one rule everything else follows: **never output a number you can't point to a source for. Refusing is a correct result; guessing is not.**
 
 ```
-packages/schema   Zod schemas, ErrorCode/RuleCode enums - shared by engine, backend and web
+packages/schema   Zod schemas, ErrorCode/RuleCode enums - used by engine and backend
 packages/engine   extract(pdfBytes) -> ExtractionResult. Pure, no AWS. Parsers, rule engine, tests.
 backend/          Lambda handlers + AWS Amplify Gen 2 infra, and a local synchronous dev server
-web/              React + Vite SPA, deployed via AWS Amplify Hosting
+web/              React + Vite SPA - standalone (own npm install/build), deployed via AWS Amplify
+                  Hosting with zero monorepo configuration
 fixtures/         the 6 sample PDFs - all present and passing
 ```
 
@@ -25,19 +26,21 @@ Two things to know about the current state:
 
 1. **The 6 sample PDFs are in `fixtures/` and all 15 `fixtures.test.ts` cases pass, for real, against the real files** - not a skip. They weren't available for most of this session (see git history if you want the "skips, not fails" scaffolding-era story), and dropping them in surfaced a real bug: `findSectionTitle` originally took "the nearest non-empty line above the table header", which happened to work on hand-built test data but was wrong against the real layouts - every real page has a fixed two-line header (company letterhead, then the actual section title: "Tax Invoice", "Invoice 1 of 4 - Materials", "Statement Summary", etc.), with narrative lines and metadata (Date, Bill to) *between* that title and the table. The old heuristic sometimes grabbed a "Date: ..." line (never useful) and, on IB-56088, grabbed a narrative line ("Summary: 9 cartons dispatched...") that coincidentally contained the word "summary" and wrongly marked all 3 of that invoice's items `needs_review`. Fixed by reading the section title from a fixed position (the second line on the page) instead of searching upward from the header - see `packages/engine/src/header.ts`. `packages/engine/tests/property.test.ts` (the sourceText/rawValue invariant, checked across every item from every fixture) also passes for real now.
 2. **The backend was actually deployed and verified, for real, in this session** - this is not a paper design. `backend` was deployed with `npx ampx sandbox` into AWS account `042704721766` (region `ap-southeast-1`, sandbox identifier `thangduong`), and the full pipeline was driven end to end against it: `POST /jobs` → presigned S3 upload → real `ObjectCreated` → SQS → the real `extract` Lambda → DynamoDB → `GET /jobs/{id}` returning the fully correct, schema-valid result, all within about two seconds. Then `web` (the Vite app) was pointed at that live API URL and driven through a real Chromium browser, uploading a real PDF and rendering the real result - not a mock. See "What was actually deployed and tested" below for the exact resources and how to reproduce or tear it down.
+3. **`web` was pulled out of the pnpm workspace entirely, by request, after real Amplify Hosting build failures.** It was originally a pnpm-workspace member importing `packages/schema` via `workspace:*`, deployed to Amplify Hosting using the Console's monorepo "App root directory" feature. In practice that path hit two real, sequential failures: first the build image doesn't have `pnpm` preinstalled and Amplify wasn't even picking up `web/amplify.yml` (ran a bare `pnpm install` and got `pnpm: command not found`), then after fixing the Console's app-root setting, Amplify's monorepo mode rejected the single-app-format YAML with `CustomerError: Monorepo spec provided without "applications" key` (that format needs a root-level `amplify.yml` with an `applications:` list, not a single-app file inside the subfolder). Rather than debug Amplify's monorepo format further, the simpler fix was to remove the need for it: `web` now has no workspace dependency at all (its own copy of the wire types, its own `npm install`/lockfile), so it can be hosted with the plainest possible single-app Amplify config - no monorepo settings, no `applications:` key, nothing Amplify-specific to get wrong. The tradeoff is explicit: `web/src/lib/schema.ts` is a hand-kept duplicate of the relevant parts of `packages/schema`, not a shared source of truth - see "Where I'm not confident".
 
 ## How to run it
 
-Requires Node >= 20 and pnpm.
+The pnpm workspace (`packages/schema`, `packages/engine`, `backend`) and `web` are two separate installs - `web` is standalone by design (see above), so it's `npm`, not `pnpm`, and there's no root command that reaches it.
 
 ```bash
+# Workspace: schema + engine + backend. Requires Node >= 20 and pnpm.
 pnpm install
+pnpm dev                 # the API, running synchronously with no AWS account -> http://localhost:8787
 
-# Terminal 1 - the API, running synchronously with no AWS account
-pnpm dev                 # -> http://localhost:8787
-
-# Terminal 2 - the web app
-pnpm dev:web              # -> http://localhost:5173, talks to localhost:8787 by default
+# web: separate install, separate terminal.
+cd web
+npm install
+npm run dev               # -> http://localhost:5173, talks to localhost:8787 by default
 ```
 
 Drop a PDF onto the page and watch it go through creating -> uploading -> processing -> done, or drop a non-PDF / oversized file and watch the refusal path.
@@ -47,11 +50,14 @@ To point the web app at a deployed API instead, set `VITE_API_URL` (e.g. in `web
 ### Tests
 
 ```bash
-pnpm test    # runs every workspace's tests: schema, engine, api, web - no AWS credentials needed
-pnpm build   # type-checks/builds every package, and produces web/dist (the production build)
+pnpm test              # workspace: schema + engine + backend - no AWS credentials needed
+pnpm build              # type-checks/builds packages/schema, packages/engine, backend
+
+cd web && npm test       # web's own test (React Testing Library)
+cd web && npm run build  # -> web/dist (the production build)
 ```
 
-`pnpm test` is genuinely offline: the engine tests use synthetic PDFs and hand-built fixtures, `backend`'s tests exercise only its pure functions (DynamoDB item reassembly, S3-event parsing) without calling AWS, and `web`'s test renders a component with React Testing Library.
+Every one of these is genuinely offline: the engine tests use synthetic PDFs and hand-built fixtures, `backend`'s tests exercise only its pure functions (DynamoDB item reassembly, S3-event parsing) without calling AWS, and `web`'s test renders a component with React Testing Library.
 
 ### Deploying
 
@@ -70,11 +76,13 @@ For a real (non-sandbox) branch deployment, connect the repo in the Amplify Cons
 
 **Web (Part B) - AWS Amplify Hosting:**
 
-1. In the Amplify Console, create a new app from this Git repo.
-2. Under the app's monorepo settings, set **App root directory** to `web` - Amplify will then pick up `web/amplify.yml`, which `cd ..`s back to the repo root to run `pnpm install` (workspace-aware) and `pnpm --filter @invoice-extractor/web build`, and publishes `web/dist` (the Vite production build).
+`web` is standalone (no workspace dependency - see "A note on this session"), so this is the plainest possible Amplify Hosting setup: no monorepo settings, no `App root directory`, no `applications:` key.
+
+1. Push `web/` as its own repository (or point Amplify at this repo with `web` set as a plain, non-monorepo app root only if your Amplify plan requires a subfolder - the `amplify.yml` itself no longer assumes either way).
+2. In the Amplify Console, create a new app from that repo. It auto-detects `web/amplify.yml` (`npm install` -> `npm run build` -> publish `dist/`) with no extra configuration.
 3. Add an environment variable `VITE_API_URL` set to the API URL from `amplify_outputs.json` (or the sandbox output), so the deployed site talks to the deployed API instead of `localhost:8787`.
 
-This Hosting side (the Console app + `amplify.yml`) was written carefully but not actually connected to a Console app in this session - see "Where I'm not confident".
+This Hosting side (the Console app + `amplify.yml`) was written carefully but not actually connected to a Console app in this session - see "Where I'm not confident". The earlier monorepo-based version of this section is gone because it's genuinely no longer how this works, not because it was wrong for its time - see point 3 in "A note on this session" for what broke and why this replaced it.
 
 ## What was actually deployed and tested
 
@@ -165,6 +173,10 @@ web/src/
   index.css             the whole design system: CSS custom-property tokens
                         (color/radius/shadow), light + dark mode via
                         prefers-color-scheme, no component library
+  lib/schema.ts         standalone copy of the wire-contract types/Zod
+                        schemas (see "A note on this session", point 3) -
+                        the one file to update by hand if the backend's
+                        packages/schema contract changes
   lib/apiClient.ts      talks to the API (createJob / uploadFile / getJob),
                         throws AppError
   lib/uploadState.ts    the UploadState discriminated union
@@ -210,17 +222,18 @@ This is the contract `packages/engine/tests/fixtures.test.ts` encodes (see `PROM
 - **`PDF_ENCRYPTED` is untested.** `document.test.ts` covers `NOT_A_PDF` and `PDF_CORRUPT` against real (if synthetic) byte content, but the encrypted path relies on pdf.js reporting a `PasswordException`, which needs an actual password-protected PDF - `pdf-lib` can't produce one, and none of the 6 fixtures are described as encrypted. The code path (`document.ts`, checking `err.name === "PasswordException"`) is short and directly mirrors pdf.js's own documented behaviour, but it's asserted, not verified.
 - **The DLQ path under real failure conditions.** The happy path (upload -> extract -> COMPLETED) was verified live. Forcing three genuine failed SQS deliveries to prove the DLQ -> `dlq` Lambda -> `FAILED` status path fires correctly in the deployed environment was not done - only reasoned through and unit-tested (`jobsTable.test.ts`'s `forceFailIfNotTerminal` coverage).
 - **`sha256` on the META item.** It's in the schema (per section 2's table) but nothing currently computes or writes it - flagged rather than silently dropped.
-- **Amplify Hosting for the web app.** `web/amplify.yml` is written to Amplify Hosting's documented monorepo build-spec format and reasoned through carefully, but - unlike the API - it was never connected to a real Amplify Console app in this session, so the exact Console monorepo settings (or the YAML itself) may need a small adjustment on a first deploy. Vite `dev`/`build` themselves were run and verified locally.
+- **Amplify Hosting for the web app.** `web/amplify.yml` is now the plainest possible single-app spec (`npm install` -> `npm run build` -> publish `dist/`) and was reasoned through carefully after the monorepo path failed twice in the real Console (see "A note on this session", point 3), but it still hasn't been run against a real Amplify Console app in this session - only `npm run build`/`npm run dev` locally. It should just work; "should" is doing real work in that sentence.
+- **`web/src/lib/schema.ts` is a hand-kept duplicate, not a shared source of truth.** Pulling `web` out of the pnpm workspace to fix the Amplify build (see above) means it no longer imports `packages/schema` - it has its own copy of the same shapes. If the backend's contract changes (a new `RuleCode`, a field renamed), `web`'s copy has to be updated by hand and nothing will warn you if it isn't - a stale copy would either fail Zod parsing (surfaced as `RESPONSE_SHAPE_INVALID`, which at least isn't silent) or, worse, silently ignore a new field it doesn't know about. This is the real cost of the standalone-repo tradeoff.
 - **A `pipeline-deploy` (non-sandbox) branch deployment.** Only `ampx sandbox` was exercised. `ampx pipeline-deploy` is the documented path for a real named-branch deployment via CI and should work the same way against the same `amplify/backend.ts`, but wasn't run.
 
 ## What I'd do with three more days
 
 - Test against a second, genuinely different invoice template (not just the 6 fixtures, which share one letterhead format) to see how much of the header/section-title logic is still fixed-position-shaped versus actually general.
 - Force a real DLQ failure against the sandbox and confirm the `FAILED` status path end to end, not just in tests.
-- Connect `web` to a real Amplify Hosting Console app and confirm the monorepo build spec works unmodified.
+- Connect `web` to a real Amplify Hosting Console app and confirm the plain single-app build spec works unmodified.
+- Replace `web/src/lib/schema.ts`'s hand-kept duplication with something that can't silently drift - either publish `packages/schema` to a registry `web` can install as a normal (non-workspace) npm dependency, or generate `web`'s copy from the source of truth as a build step.
 - Implement OCR via Textract `AnalyzeExpense` behind `OCR_ENABLED`, with a confidence threshold and the same arithmetic cross-checks, surfaced through the `ocrConfidence` field that's already in the evidence schema.
 - Bounding-box highlighting on a rendered page image in the UI (the `bbox` field is already in the schema, just unused) instead of just highlighting the matched substring in the source line.
 - Broaden `CONFLICTING_STATEMENTS` and the header-keyword lists against a real corpus of invoice layouts instead of the hand-picked patterns here.
 - Compute and store the file's `sha256` (dedup, integrity).
 - Auth and per-customer storage.
-# invoice-extraction

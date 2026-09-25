@@ -24,9 +24,9 @@ export default tseslint.config(
       "@typescript-eslint/no-unused-vars": ["warn", { argsIgnorePattern: "^_" }],
     },
   },
-  // web/: React rules, browser globals.
+  // src/: React rules, browser globals.
   {
-    files: ["web/**/*.{ts,tsx}"],
+    files: ["src/**/*.{ts,tsx}"],
     plugins: { "react-hooks": reactHooks },
     languageOptions: {
       globals: { ...globals.browser },
